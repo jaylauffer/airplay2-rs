@@ -74,3 +74,16 @@ upstream changes or editing either example.
 - mDNS parsing occasionally warns `invalid UUID: <a>+<b>` for a
   multi-room-group service announcement variant; harmless -- the device's
   primary AirPlay service record still parses and resolves correctly.
+- **Real bug, found and fixed 2026-09-06:** a receiver can silently mute
+  itself mid-stream if its incoming audio stalls for a few seconds (e.g. a
+  buffer underrun from the sender side going quiet). The actual root cause
+  that day was entirely on the `sng-bass-blaster` side (a blocking
+  discovery scan on its main render loop -- see that repo's
+  `docs/UI_INPUT_FINDINGS.md`), but `live_stdin_sender.rs`'s reader thread
+  was hardened at the same time: it now uses `LiveFrameSender::try_send`
+  (drop-on-backpressure) instead of the blocking `send`, so a slow/stuck
+  `AudioStreamer` consumer can no longer stall this thread's `read_exact`
+  loop and back-pressure the parent process's stdin writes. If a receiver
+  ever mutes again with the fixed parent-side scheduling, check for
+  dropped-frame warnings from this reader thread first before assuming a
+  new root cause.
