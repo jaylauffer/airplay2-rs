@@ -92,17 +92,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Connected. Setting up stream...");
     conn.setup().await?;
 
-    let (sender, live_decoder) = LiveAudioDecoder::create_pair(sample_rate, channels, 32);
+    // 64 frames of ~1024-sample chunks is a few hundred ms of headroom
+    // against the parent process's feed being bursty (it polls its own
+    // capture tap once per render frame, not in perfectly steady
+    // real-time slices) rather than a hard real-time source.
+    let (sender, live_decoder) = LiveAudioDecoder::create_pair(sample_rate, channels, 64);
 
     // Reader thread: raw interleaved i16 LE PCM from stdin -> LivePcmFrame.
     // A dedicated std::thread (not a tokio task) since std::io::Stdin's
     // blocking read is the simplest way to backpressure against a parent
     // process writing at the real capture rate.
+    //
+    // Uses `try_send` (drop-oldest-effectively, since a full channel just
+    // means this frame is skipped), not the blocking `send`. A blocking
+    // send here would, under sustained backpressure from a slow/stalled
+    // AudioStreamer consumer, stall this thread's `read_exact` loop --
+    // which stalls the parent process's writes to our stdin pipe once its
+    // OS pipe buffer fills, which stalls whatever the parent uses to
+    // decide it's safe to keep capturing (see
+    // sng-bass-blaster/docs/UI_INPUT_FINDINGS.md for the specific stall
+    // that motivated this: a periodic ~4s blocking scan on the parent's
+    // main loop, fixed there, but this side of the pipe should not be
+    // able to propagate a stall either). A dropped live-audio frame is a
+    // brief glitch; a stalled pipe is a stuck stream that needs a manual
+    // reconnect.
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut lock = stdin.lock();
         let frames_per_chunk = 1024;
         let mut byte_buf = vec![0u8; frames_per_chunk * channels as usize * 2];
+        let mut dropped_frames = 0u64;
         loop {
             match lock.read_exact(&mut byte_buf) {
                 Ok(()) => {
@@ -115,9 +134,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         channels,
                         sample_rate,
                     };
-                    if !sender.send(frame) {
-                        eprintln!("live decoder dropped, stopping reader thread");
-                        break;
+                    if !sender.try_send(frame) {
+                        dropped_frames += 1;
+                        if dropped_frames.is_multiple_of(100) {
+                            eprintln!(
+                                "live decoder backpressured, dropped {dropped_frames} frames so far"
+                            );
+                        }
                     }
                 }
                 Err(error) => {
