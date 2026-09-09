@@ -87,3 +87,66 @@ upstream changes or editing either example.
   ever mutes again with the fixed parent-side scheduling, check for
   dropped-frame warnings from this reader thread first before assuming a
   new root cause.
+
+## Real bug, found and fixed 2026-09-09: sync packets declared zero latency
+
+`sng-bass-blaster` reported broadcasting to a HomePod working for about
+five seconds, going choppy, then shutting off. The cause was here, not
+there, and it affected every session to that device.
+
+`RtpSender::send_sync`/`prepare_sync` in
+`crates/airplay-audio/src/rtp.rs` built the 20-byte RAOP sync packet with
+both RTP timestamp fields set to the same value:
+
+```rust
+packet[4..8]   = rtp_timestamp;   // "RTP timestamp less latency"
+packet[16..20] = rtp_timestamp;   // "RTP timestamp now"
+```
+
+Bytes 4-7 tell the receiver which timestamp it should be **rendering** at
+the NTP instant carried in bytes 8-15. Filling them with the current
+timestamp declares a render latency of zero -- the receiver is told to
+play every packet the instant it arrives. `RtpSender` carried no latency
+value at all, so there was nothing to subtract. A HomePod renders its
+initial prefill, then chops, then mutes the session.
+
+**Nothing on the sender side reports this.** RTSP `feedback` keeps
+returning 200 OK, the NTP timing server keeps answering the receiver's
+requests every ~2.5s, sync packets keep going out on schedule (verified:
+51 of them across a 50s run, one per ~44352 frames), and RTP keeps
+flowing indefinitely. The receiver also never sends anything back -- zero
+retransmit requests -- so there is no inbound signal to notice either.
+
+**Fix:**
+
+- `RtpSender` gains a `sync_latency: u32` field plus `set_sync_latency`,
+  defaulting to 0 so existing callers and unit tests are unaffected.
+- Both NTP sync builders now emit `rtp_timestamp - sync_latency` in
+  bytes 4-7. `prepare_ptp_sync`/`send_ptp_sync` are untouched (different
+  packet layout, and PTP mode is separately broken -- see below).
+- `streamer.rs` sets it from `config.latency_min` at each sync.
+- `crates/airplay-client/examples/live_stdin_sender.rs` now declares
+  `latency_min: 11025` (~250ms) instead of `4410` (~100ms). 11025 is
+  simply `StreamConfig::default()`'s own value; the example had been
+  overriding it downward. Measured against a real HomePod: 0 gave 3.4s of
+  audio before permanent silence, 4410 gave 43.7s with a gap, 11025 gave
+  a clean 49.2s -- the whole take.
+
+**Verification method** (worth reusing): pipe a real-time-paced synthetic
+tone into `live_stdin_sender`, record the room off a webcam mic with
+`ffmpeg -f avfoundation`, and score 50ms blocks with a Goertzel filter at
+the tone frequency divided by block RMS. That level-independent
+"tonality" ratio survives the mic level swinging around; an absolute
+amplitude threshold does not. Full write-up, including everything that
+was ruled out, in `sng-bass-blaster/docs/UI_INPUT_FINDINGS.md` section 8.
+
+**Known-failing test, pre-existing:** `-p airplay-audio`'s
+`test_continuous_streaming_simulation` ("Captured too few periods")
+fails identically on an untouched tree; it is timing-sensitive and
+unrelated to this change. Confirmed by stashing everything and re-running.
+
+**`--ptp` is non-functional.** It performs a full BMCA negotiation and
+correctly yields master to the HomePod (priority1 248 vs our 250), then
+logs `gPTP BMCA initialized (offset: 0 ns)` -- no offset against the
+master clock is ever computed, and no audio plays at all. NTP timing plus
+the sync-latency fix above is the working path.

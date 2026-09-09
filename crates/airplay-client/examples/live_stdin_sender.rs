@@ -24,7 +24,7 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(tracing::Level::DEBUG)
         .with_writer(std::io::stderr)
         .init();
 
@@ -81,7 +81,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Lower than the file-playback example's 500ms/2s: this is a live
         // monitor, so minimizing added latency matters more than absorbing
         // network jitter for a one-shot file play.
-        latency_min: 4410, // ~100ms @ 44100Hz
+        // The sync packet reports `current_rtp_ts - latency_min` as the
+        // timestamp the receiver should be rendering, so this is a real
+        // commitment, not just a hint: too small and the receiver is told
+        // to render packets the instant they arrive, which a HomePod
+        // tolerates for about five seconds before it chops and mutes.
+        // 250ms measured clean over a full take; 100ms did not.
+        latency_min: 11025, // ~250ms @ 44100Hz
         latency_max: 22050, // ~500ms @ 44100Hz
         supports_dynamic_stream_id: true,
         asc,
@@ -155,13 +161,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("READY");
     eprintln!("Streaming...");
 
+    // `Connection::send_feedback` treats a timeout as `Ok(())` (a
+    // best-effort keepalive shouldn't kill the stream over one slow
+    // reply), so a feedback request that's silently timing out every
+    // single time would never show up as an error here even though it
+    // may be exactly what makes a receiver eventually stop trusting the
+    // session. Timed explicitly and always logged at a visible level
+    // while diagnosing sng-bass-blaster's reported "speaker goes silent
+    // after roughly a minute" -- see that repo's docs/UI_INPUT_FINDINGS.md.
     let mut feedback_tick = 0u32;
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         feedback_tick += 1;
         if feedback_tick % 2 == 0 {
-            if let Err(error) = conn.send_feedback().await {
-                tracing::warn!("Feedback failed: {}", error);
+            let started = std::time::Instant::now();
+            match conn.send_feedback().await {
+                Ok(()) => {
+                    eprintln!("feedback ok, round-trip {:?}", started.elapsed());
+                }
+                Err(error) => {
+                    eprintln!("feedback FAILED after {:?}: {error}", started.elapsed());
+                }
             }
         }
     }

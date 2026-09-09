@@ -1,7 +1,7 @@
 //! High-level audio streaming orchestrator.
 
 use airplay_core::{StreamConfig, error::Result};
-use crate::{AudioBuffer, AudioDecoder, RtpSender, LiveAudioDecoder};
+use crate::{AudioBuffer, AudioDecoder, AudioFrame, RtpSender, LiveAudioDecoder};
 use crate::encoder::{create_encoder, AudioEncoder};
 use crate::eq::{EqConfig, EqParams, Equalizer};
 use airplay_timing::{Clock, ClockOffset, unix_to_ntp};
@@ -1029,18 +1029,43 @@ async fn run_streamer(
                         guard.state = StreamerState::Stopped;
                         state_cache.store(StreamerState::Stopped as u8, Ordering::Relaxed);
                         break;
-                    } else {
-                        // Still buffering, wait and retry
-                        drop(guard);
-                        sleep(Duration::from_millis(10)).await;
-                        // Reset deadline after buffering stall
-                        next_deadline = Instant::now();
-                        continue;
                     }
+                    // Otherwise: still buffering but not exhausted. Used to
+                    // `sleep(10ms); continue` here, skipping this tick
+                    // entirely -- which, for a live source recovering from
+                    // a momentary stall, meant real gaps in the RTP
+                    // sequence/timestamp progression with nothing telling
+                    // the receiver they were deliberate. Real-device
+                    // testing showed that causes audible static and the
+                    // receiver eventually muting the stream outright, not
+                    // just harmless silence (see
+                    // sng-bass-blaster/docs/UI_INPUT_FINDINGS.md). Falling
+                    // through to the silent-packet path below instead
+                    // keeps the wire-level stream perfectly continuous for
+                    // as long as recovery takes.
                 }
             }
 
-            let frame = guard.buffer.pop();
+            // `.or_else` (not `.unwrap_or_else`) so the buffer-empty branch
+            // only rebuilds a silent frame when there's genuinely nothing
+            // to pop, rather than on every tick.
+            let frame = guard.buffer.pop().or_else(|| {
+                let count = underrun_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                if count <= 5 || count % 50 == 0 {
+                    tracing::warn!(
+                        "Buffer underrun #{count} (buffer empty, sending silence to preserve RTP continuity)"
+                    );
+                }
+                guard.state = StreamerState::Buffering;
+                state_cache.store(StreamerState::Buffering as u8, Ordering::Relaxed);
+
+                let channels = usize::from(guard.config.audio_format.channels.max(1));
+                let frames_per_packet = guard.config.audio_format.frames_per_packet as usize;
+                Some(AudioFrame::new(
+                    vec![0i16; frames_per_packet * channels],
+                    guard.current_timestamp,
+                ))
+            });
             if let Some(frame) = frame {
                 // Diagnostic: log PCM sample energy for first few frames
                 static DIAG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1092,6 +1117,7 @@ async fn run_streamer(
                 let payload_type = guard.config.stream_type as u8;
                 let sample_rate = guard.config.audio_format.sample_rate.as_hz();
                 let last_sync_rtp = guard.last_sync_rtp;
+                let sync_latency = guard.config.latency_min;
 
                 // Get current time and apply clock offset from PTP/NTP sync
                 let local_wall = guard.clock.now_wall_ns();
@@ -1146,6 +1172,7 @@ async fn run_streamer(
                                 let next_rtp_ts = rtp_ts.wrapping_add(sample_rate / 44100 * 352);
                                 guard.rtp_senders[0].prepare_ptp_sync(rtp_ts, render_adjusted, next_rtp_ts, &ptp_clock_id)?
                             } else {
+                                guard.rtp_senders[0].set_sync_latency(sync_latency);
                                 guard.rtp_senders[0].prepare_sync(rtp_ts, ntp)?
                             }
                         } else {
@@ -1201,6 +1228,7 @@ async fn run_streamer(
                                 let next_rtp_ts = rtp_ts.wrapping_add(sample_rate / 44100 * 352);
                                 guard.rtp_senders[0].send_ptp_sync(rtp_ts, render_adjusted, next_rtp_ts, &ptp_clock_id)?;
                             } else {
+                                guard.rtp_senders[0].set_sync_latency(sync_latency);
                                 guard.rtp_senders[0].send_sync(rtp_ts, ntp)?;
                             }
                         }
@@ -1233,14 +1261,10 @@ async fn run_streamer(
                         packets_sent_counter.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-            } else {
-                let count = underrun_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                if count <= 5 || count % 50 == 0 {
-                    tracing::warn!("Buffer underrun #{} (buffer empty, packet skipped)", count);
-                }
-                guard.state = StreamerState::Buffering;
-                state_cache.store(StreamerState::Buffering as u8, Ordering::Relaxed);
             }
+            // `frame` from `guard.buffer.pop().or_else(...)` above is
+            // always `Some` now (real data or synthesized silence), so
+            // there is no buffer-empty `else` branch here any more.
         }
 
         if has_sender_thread {

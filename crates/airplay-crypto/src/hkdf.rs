@@ -46,6 +46,15 @@ pub mod constants {
     pub const CONTROL_WRITE_KEY_INFO: &[u8] = b"Control-Write-Encryption-Key";
     pub const CONTROL_READ_KEY_INFO: &[u8] = b"Control-Read-Encryption-Key";
 
+    /// Keys for the reverse "events" TCP connection (the receiver's
+    /// required session keep-alive channel -- see
+    /// `SessionKeys::derive_events_keys`'s doc comment for why this
+    /// exists and why getting it wrong looks like a healthy stream that
+    /// silently mutes).
+    pub const EVENTS_SALT: &[u8] = b"Events-Salt";
+    pub const EVENTS_WRITE_KEY_INFO: &[u8] = b"Events-Write-Encryption-Key";
+    pub const EVENTS_READ_KEY_INFO: &[u8] = b"Events-Read-Encryption-Key";
+
     // Placeholder constants for FairPlay-derived stream keys.
     // TODO: Replace with real FairPlay key derivation parameters.
     pub const FAIRPLAY_EKEY_INFO: &[u8] = b"AirPlay-FairPlay-EKEY";
@@ -93,6 +102,26 @@ pub fn derive_control_read_key(shared_secret: &[u8]) -> Result<[u8; 32], CryptoE
         shared_secret,
         constants::CONTROL_SALT,
         constants::CONTROL_READ_KEY_INFO,
+    )
+}
+
+/// Derive events channel write key (i.e. the key we encrypt with when
+/// answering the receiver's `POST /command` pushes).
+pub fn derive_events_write_key(shared_secret: &[u8]) -> Result<[u8; 32], CryptoError> {
+    derive_key_32(
+        shared_secret,
+        constants::EVENTS_SALT,
+        constants::EVENTS_WRITE_KEY_INFO,
+    )
+}
+
+/// Derive events channel read key (i.e. the key we decrypt the
+/// receiver's pushed requests with).
+pub fn derive_events_read_key(shared_secret: &[u8]) -> Result<[u8; 32], CryptoError> {
+    derive_key_32(
+        shared_secret,
+        constants::EVENTS_SALT,
+        constants::EVENTS_READ_KEY_INFO,
     )
 }
 

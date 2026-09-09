@@ -58,10 +58,7 @@ impl EncryptedChannel {
     /// The write nonce is automatically incremented after each call.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
         // Encrypt with current nonce
-        let ciphertext = self
-            .write_cipher
-            .encrypt(plaintext)
-            .map_err(|e| Error::Crypto(e))?;
+        let ciphertext = self.encrypt_raw(plaintext)?;
 
         // Build framed message: length (2 BE) + ciphertext
         let len = ciphertext.len() as u16;
@@ -78,11 +75,11 @@ impl EncryptedChannel {
     /// The write nonce is automatically incremented after each call.
     pub fn encrypt_raw(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
         self.write_cipher
-            .encrypt(plaintext)
+            .encrypt_raw(plaintext)
             .map_err(|e| Error::Crypto(e))
     }
 
-    /// Decrypt framed data (expects 2-byte little-endian length prefix).
+    /// Decrypt framed data (expects 2-byte big-endian length prefix).
     ///
     /// Parses the length prefix and decrypts the ciphertext.
     /// The read nonce is automatically incremented after each call.
@@ -94,7 +91,7 @@ impl EncryptedChannel {
         }
 
         // Parse length prefix
-        let len = u16::from_le_bytes([framed[0], framed[1]]) as usize;
+        let len = u16::from_be_bytes([framed[0], framed[1]]) as usize;
         let expected_total = 2 + len;
 
         if framed.len() < expected_total {
@@ -147,7 +144,7 @@ impl EncryptedChannel {
         if data.len() < 2 {
             return None;
         }
-        let len = u16::from_le_bytes([data[0], data[1]]) as usize;
+        let len = u16::from_be_bytes([data[0], data[1]]) as usize;
         Some(2 + len)
     }
 }

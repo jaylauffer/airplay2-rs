@@ -131,6 +131,29 @@ impl ControlCipher {
         self.decrypt_block(ciphertext_with_tag, block_len)
     }
 
+    /// Encrypt a single raw plaintext block (no embedded length prefix),
+    /// using AAD=len(plaintext). Pairs with `decrypt_raw`, which derives
+    /// the same AAD from `ciphertext_with_tag.len() - 16` -- so the
+    /// output here must carry no header of its own, unlike `encrypt()`'s
+    /// HomeKit multi-block framing.
+    pub fn encrypt_raw(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        let aad = (plaintext.len() as u16).to_le_bytes();
+        let nonce = build_nonce_from_counter(self.encrypt_counter);
+        let nonce = Nonce::from_slice(&nonce);
+        let payload = Payload {
+            msg: plaintext,
+            aad: &aad,
+        };
+
+        let ciphertext_with_tag = self
+            .write_cipher
+            .encrypt(nonce, payload)
+            .map_err(|e| CryptoError::Encryption(format!("Encryption failed: {}", e)))?;
+
+        self.encrypt_counter += 1;
+        Ok(ciphertext_with_tag)
+    }
+
     /// Decrypt HomeKit-framed data (with length prefix).
     ///
     /// Format: [u16_le len][ciphertext][16-byte tag] repeated for each block.

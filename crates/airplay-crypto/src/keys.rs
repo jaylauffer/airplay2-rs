@@ -64,6 +64,28 @@ impl SessionKeys {
         })
     }
 
+    /// Derive session keys for the reverse "events" connection.
+    ///
+    /// The receiver opens a TCP connection back to the sender after SETUP
+    /// and expects it to behave like a real encrypted RTSP peer, pushing
+    /// `POST /command` requests the sender must decrypt and answer. This
+    /// is the receiver's actual session keep-alive; a sender that leaves
+    /// it unserviced looks perfectly healthy (RTP flows, feedback GET
+    /// succeeds) right up until the receiver decides the session is dead
+    /// and mutes -- which is what "plays fine, then goes silent" turned
+    /// out to be. Read/write are swapped relative to `derive_control_keys`
+    /// because this connection is receiver-initiated: what the receiver
+    /// writes is what we read, and vice versa.
+    pub fn derive_events_keys(shared_secret: &SharedSecret) -> Result<Self, CryptoError> {
+        let write_key = hkdf::derive_events_write_key(shared_secret.as_bytes())?;
+        let read_key = hkdf::derive_events_read_key(shared_secret.as_bytes())?;
+
+        Ok(Self {
+            write_key: EncryptionKey(write_key),
+            read_key: EncryptionKey(read_key),
+        })
+    }
+
     /// Derive session keys for pair-setup encryption.
     pub fn derive_pair_setup_keys(
         shared_secret: &SharedSecret,

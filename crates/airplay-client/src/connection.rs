@@ -4,8 +4,9 @@ use airplay_core::{Device, StreamConfig, error::Result};
 use airplay_core::error::{Error as CoreError, RtspError};
 use airplay_core::features::AuthMethod;
 use airplay_rtsp::{RtspConnection, RtspSession, SessionState, RtspRequest};
-use airplay_pairing::{PairingSession, PairVerify, PairSetup, ControllerIdentity};
+use airplay_pairing::{PairingSession, PairVerify, PairSetup, ControllerIdentity, EncryptedChannel};
 use airplay_crypto::ed25519::IdentityKeyPair;
+use airplay_crypto::keys::SessionKeys;
 use std::path::PathBuf;
 use std::fs;
 // Timing imports reserved for future use
@@ -24,6 +25,7 @@ use airplay_core::stream::TimingProtocol;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Generate a random MAC-like device ID for the client.
 fn generate_device_id() -> String {
@@ -214,6 +216,15 @@ pub struct Connection {
     control_receiver: Option<Arc<RtpReceiver>>,
     /// Reverse connection to device's events port (required before RECORD)
     events_stream: Option<TcpStream>,
+    /// Encrypted framing for the events connection, keyed from the same
+    /// pairing shared secret as the control channel but with read/write
+    /// roles swapped since the device (not us) initiates this connection.
+    events_channel: Option<EncryptedChannel>,
+    /// Background task that services the events connection: reads the
+    /// device's pushed `POST /command` keep-alive requests, decrypts,
+    /// and answers them. Without this the device silently mutes the
+    /// session after roughly 10-90s even though RTP keeps flowing fine.
+    events_task: Option<JoinHandle<()>>,
     /// Remote PTP master clock identity (from BMCA yield flow)
     ptp_master_clock_id: Option<[u8; 8]>,
     /// Render delay in ms added to NTP timestamps for extra retransmit headroom.
@@ -224,6 +235,87 @@ pub struct Connection {
     eq_params: Option<Arc<EqParams>>,
     /// Stream statistics (shared with control channel threads).
     stream_stats: Arc<crate::stats::StreamStats>,
+}
+
+/// Derive the events channel's `EncryptedChannel` from a pairing shared
+/// secret, if one is available. Read/write are swapped relative to the
+/// control channel because the events connection is device-initiated:
+/// what we derive as "write" is keyed for the device's outgoing traffic
+/// (our read), and vice versa.
+fn build_events_channel(shared_secret: Option<&SharedSecret>) -> Option<EncryptedChannel> {
+    let shared_secret = shared_secret?;
+    match SessionKeys::derive_events_keys(shared_secret) {
+        Ok(events_keys) => Some(EncryptedChannel::with_keys(
+            *events_keys.read_key.as_bytes(),
+            *events_keys.write_key.as_bytes(),
+        )),
+        Err(error) => {
+            warn!("Failed to derive events channel keys: {error}");
+            None
+        }
+    }
+}
+
+/// Service the reverse "events" connection for the lifetime of the stream.
+///
+/// The receiver treats this connection as the real session keep-alive:
+/// it periodically pushes an encrypted `POST /command` (RTSP-style)
+/// request and expects a byte-precise minimal `200 OK` echoing the
+/// request's `CSeq` back, encrypted the same way. Miss enough of these
+/// and the receiver mutes the session while RTP keeps flowing fine --
+/// which is exactly what looked like unexplained fuzz-then-silence
+/// before this was wired up.
+async fn service_events_connection(mut stream: TcpStream, mut channel: EncryptedChannel) {
+    loop {
+        let mut header = [0u8; 2];
+        if let Err(error) = stream.read_exact(&mut header).await {
+            tracing::info!("Events connection closed: {error}");
+            return;
+        }
+        let len = u16::from_be_bytes(header) as usize;
+
+        let mut body = vec![0u8; len];
+        if let Err(error) = stream.read_exact(&mut body).await {
+            tracing::warn!("Events connection read error: {error}");
+            return;
+        }
+
+        let plaintext = match channel.decrypt_raw(&body) {
+            Ok(plaintext) => plaintext,
+            Err(error) => {
+                tracing::warn!("Failed to decrypt events channel message: {error}");
+                continue;
+            }
+        };
+
+        let request = String::from_utf8_lossy(&plaintext);
+        let cseq = request
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("CSeq:")
+                    .or_else(|| line.strip_prefix("cseq:"))
+            })
+            .map(str::trim)
+            .unwrap_or("0")
+            .to_string();
+        tracing::debug!(
+            "Events channel request (CSeq {cseq}): {}",
+            request.lines().next().unwrap_or("")
+        );
+
+        let response = format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n\r\n");
+        let framed = match channel.encrypt(response.as_bytes()) {
+            Ok(framed) => framed,
+            Err(error) => {
+                tracing::warn!("Failed to encrypt events channel response: {error}");
+                return;
+            }
+        };
+        if let Err(error) = stream.write_all(&framed).await {
+            tracing::warn!("Events connection write error: {error}");
+            return;
+        }
+    }
 }
 
 impl Connection {
@@ -321,6 +413,8 @@ impl Connection {
 
         session.set_paired()?;
 
+        let events_channel = build_events_channel(pairing.shared_secret());
+
         Ok(Self {
             device,
             rtsp,
@@ -339,6 +433,8 @@ impl Connection {
             control_receiver: None,
             control_task: None,
             events_stream: None,
+            events_channel,
+            events_task: None,
             render_delay_ms: 0,
             eq_config: None,
             eq_params: None,
@@ -486,6 +582,13 @@ impl Connection {
 
         session.set_paired()?;
 
+        let events_channel = build_events_channel(
+            pair_verify
+                .shared_secret()
+                .map(|s| SharedSecret::new(s.to_vec()))
+                .as_ref(),
+        );
+
         Ok(Self {
             device,
             rtsp,
@@ -504,6 +607,8 @@ impl Connection {
             control_receiver: None,
             control_task: None,
             events_stream: None,
+            events_channel,
+            events_task: None,
             render_delay_ms: 0,
             eq_config: None,
             eq_params: None,
@@ -687,6 +792,13 @@ impl Connection {
 
         session.set_paired()?;
 
+        let events_channel = build_events_channel(
+            pair_verify
+                .shared_secret()
+                .map(|s| SharedSecret::new(s.to_vec()))
+                .as_ref(),
+        );
+
         Ok(Self {
             device,
             rtsp,
@@ -705,6 +817,8 @@ impl Connection {
             control_receiver: None,
             control_task: None,
             events_stream: None,
+            events_channel,
+            events_task: None,
             render_delay_ms: 0,
             eq_config: None,
             eq_params: None,
@@ -716,6 +830,28 @@ impl Connection {
     #[deprecated(since = "0.2.0", note = "Use connect_with_pin_pairing instead")]
     pub async fn connect_with_fruit_pairing(device: Device, config: StreamConfig, pin: &str) -> Result<Self> {
         Self::connect_with_pin_pairing(device, config, pin).await
+    }
+
+    /// Take the derived events channel keys (if any) and start servicing
+    /// the just-opened events connection in the background.
+    ///
+    /// Falls back to just stashing the raw stream (the old, unserviced
+    /// behavior) if no events keys were derived at connect time, so a
+    /// missing shared secret degrades to the previous behavior instead
+    /// of dropping the connection outright.
+    fn spawn_events_task(&mut self, stream: TcpStream) {
+        match self.events_channel.take() {
+            Some(channel) => {
+                self.events_task = Some(tokio::spawn(service_events_connection(stream, channel)));
+            }
+            None => {
+                warn!(
+                    "No events channel keys derived; events keep-alive will not be serviced \
+                     (receiver may mute the session after roughly 10-90s)"
+                );
+                self.events_stream = Some(stream);
+            }
+        }
     }
 
     /// Complete RTSP SETUP phases (called before streaming).
@@ -797,7 +933,7 @@ impl Connection {
         match TcpStream::connect(events_addr).await {
             Ok(stream) => {
                 tracing::info!("Events connection established");
-                self.events_stream = Some(stream);
+                self.spawn_events_task(stream);
             }
             Err(e) => {
                 // Not fatal - owntone says "proceeding anyway" if this fails
@@ -975,6 +1111,10 @@ impl Connection {
         }
 
         if let Some(task) = self.timing_task.take() {
+            task.abort();
+        }
+
+        if let Some(task) = self.events_task.take() {
             task.abort();
         }
 
@@ -1521,7 +1661,7 @@ impl Connection {
         match tokio::net::TcpStream::connect(events_addr).await {
             Ok(stream) => {
                 tracing::info!("Events connection established");
-                self.events_stream = Some(stream);
+                self.spawn_events_task(stream);
             }
             Err(e) => {
                 warn!("Could not connect to events port {} (proceeding anyway): {}", events_addr, e);
@@ -1679,7 +1819,7 @@ impl Connection {
         match TcpStream::connect(events_addr).await {
             Ok(stream) => {
                 tracing::info!("Events connection established (group member)");
-                self.events_stream = Some(stream);
+                self.spawn_events_task(stream);
             }
             Err(e) => {
                 warn!("Could not connect to events port {} (proceeding anyway): {}", events_addr, e);

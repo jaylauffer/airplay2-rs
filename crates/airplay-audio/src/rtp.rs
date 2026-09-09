@@ -391,6 +391,16 @@ pub struct RtpSender {
     sync_sequence: u16,
     /// Whether the first sync packet has been sent (needs extension bit)
     first_sync_sent: bool,
+    /// Render latency, in frames, that this sender has committed to.
+    ///
+    /// Subtracted from the current RTP timestamp to fill the sync packet's
+    /// "RTP timestamp less latency" field (bytes 4-7) -- the timestamp the
+    /// receiver should be rendering at the sync packet's NTP instant.
+    /// Leaving this at 0 tells the receiver to render each packet the
+    /// moment it arrives, which no receiver can honour: a HomePod plays
+    /// the initial buffer, then chops and mutes the session after a few
+    /// seconds. Set from the stream config's declared latency.
+    sync_latency: u32,
     /// Ring buffer of recently sent serialized packets, indexed by (sequence % PACKET_HISTORY_SIZE).
     packet_history: Vec<Option<Vec<u8>>>,
 }
@@ -412,6 +422,7 @@ impl RtpSender {
             ssrc,
             cipher: None,
             sync_sequence: 0,
+            sync_latency: 0,
             first_sync_sent: false,
             packet_history,
         }
@@ -577,6 +588,11 @@ impl RtpSender {
     /// - Bytes 4-7: Current playback position in samples (BE)
     /// - Bytes 8-15: NTP timestamp (8 bytes BE - seconds + fraction)
     /// - Bytes 16-19: RTP timestamp (BE)
+    /// Set the render latency (in frames) reported in sync packets.
+    pub fn set_sync_latency(&mut self, frames: u32) {
+        self.sync_latency = frames;
+    }
+
     pub fn send_sync(&mut self, rtp_timestamp: u32, ntp_timestamp: u64) -> Result<()> {
         // Get the destination - control port if set, otherwise data port
         let dest = self.control_dest.unwrap_or(self.dest);
@@ -611,7 +627,7 @@ impl RtpSender {
         packet[2..4].copy_from_slice(&self.sync_sequence.to_be_bytes());
         self.sync_sequence = self.sync_sequence.wrapping_add(1);
         // Bytes 4-7: Current playback position (use rtp_timestamp)
-        packet[4..8].copy_from_slice(&rtp_timestamp.to_be_bytes());
+        packet[4..8].copy_from_slice(&rtp_timestamp.wrapping_sub(self.sync_latency).to_be_bytes());
         // Bytes 8-15: NTP timestamp (8 bytes BE)
         packet[8..16].copy_from_slice(&ntp_timestamp.to_be_bytes());
         // Bytes 16-19: RTP timestamp (BE)
@@ -654,7 +670,7 @@ impl RtpSender {
         packet[1] = 0xd4;
         packet[2..4].copy_from_slice(&self.sync_sequence.to_be_bytes());
         self.sync_sequence = self.sync_sequence.wrapping_add(1);
-        packet[4..8].copy_from_slice(&rtp_timestamp.to_be_bytes());
+        packet[4..8].copy_from_slice(&rtp_timestamp.wrapping_sub(self.sync_latency).to_be_bytes());
         packet[8..16].copy_from_slice(&ntp_timestamp.to_be_bytes());
         packet[16..20].copy_from_slice(&rtp_timestamp.to_be_bytes());
 
