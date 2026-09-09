@@ -132,6 +132,27 @@ retransmit requests -- so there is no inbound signal to notice either.
   audio before permanent silence, 4410 gave 43.7s with a gap, 11025 gave
   a clean 49.2s -- the whole take.
 
+**Follow-up, same investigation (2026-09-09): the NTP stamp was stale
+too.** The encode loop stamped the sync packet's NTP timestamp when it
+built the packet, but the packet then sat in the sender thread's queue --
+a steady ~76ms -- before going on the wire. That told the receiver the
+audio should already have been rendered 76ms ago, silently eating the
+same amount out of the declared latency: a declared 250ms bought only
+~174ms of real headroom, and a declared 100ms bought ~24ms, which is why
+100ms failed. `sender_thread_main` now calls `restamp_sync_ntp` to
+rewrite bytes 8-15 at the moment of sending (NTP sync packets only --
+identified by their 20-byte length, since PTP sync packets are 28 bytes
+with a different layout). Declared latency now means what it says and no
+longer varies with queue depth.
+
+With that in place `live_stdin_sender` gained **`--latency-ms N`**,
+defaulting to **150**, replacing the hardcoded `latency_min`. The
+declared value is now the delay actually heard, so it is worth sweeping
+by ear: 150ms of genuine headroom against the ~24ms that demonstrably
+failed. Below 100ms is unlikely to hold. **Not yet confirmed by ear at
+150ms** -- the change is reasoned and compiles, but the listening test
+was deferred.
+
 **Verification method** (worth reusing): pipe a real-time-paced synthetic
 tone into `live_stdin_sender`, record the room off a webcam mic with
 `ffmpeg -f avfoundation`, and score 50ms blocks with a Goertzel filter at

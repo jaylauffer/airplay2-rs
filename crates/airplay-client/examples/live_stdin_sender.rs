@@ -7,7 +7,7 @@
 //! project built for its own Bluetooth-capture-to-AirPlay feature.
 //!
 //! Run with:
-//!   cargo run -p airplay-client --example live_stdin_sender -- <ip> <port> [--sample-rate N] [--channels N] [--ptp]
+//!   cargo run -p airplay-client --example live_stdin_sender -- <ip> <port> [--sample-rate N] [--channels N] [--latency-ms N] [--ptp]
 //!
 //! Prints "READY" to stdout on its own line once streaming has started, so
 //! a parent process knows when it's safe to start writing PCM.
@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!(
-            "Usage: {} <ip> <port> [--sample-rate N] [--channels N] [--ptp]",
+            "Usage: {} <ip> <port> [--sample-rate N] [--channels N] [--latency-ms N] [--ptp]",
             args[0]
         );
         std::process::exit(1);
@@ -52,6 +52,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(2);
     let use_ptp = args.iter().any(|a| a == "--ptp");
+    // Declared render latency. The sync packet reports
+    // `current_rtp_ts - latency` against a send-time NTP stamp, so this is
+    // the delay you actually hear -- worth tuning by ear rather than leaving
+    // at a guess. 250ms was the first value measured stable, but that was
+    // before send-time stamping stopped ~76ms of queue lead being eaten out
+    // of the real headroom; 150ms should now behave as the old 250ms did.
+    // Sweep it before settling on a number.
+    let latency_ms: u32 = args
+        .iter()
+        .position(|a| a == "--latency-ms")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(150);
+    let latency_frames = latency_ms * 44100 / 1000;
 
     eprintln!("Scanning for {}:{}...", target_ip, target_port);
     let browser = ServiceBrowser::new()?;
@@ -86,13 +100,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // commitment, not just a hint: too small and the receiver is told
         // to render packets the instant they arrive, which a HomePod
         // tolerates for about five seconds before it chops and mutes.
-        // 250ms measured clean over a full take; 100ms did not.
-        latency_min: 11025, // ~250ms @ 44100Hz
+        latency_min: latency_frames,
         latency_max: 22050, // ~500ms @ 44100Hz
         supports_dynamic_stream_id: true,
         asc,
     };
 
+    eprintln!("Declared render latency: {latency_ms}ms ({latency_frames} frames @ 44100Hz)");
     eprintln!("Connecting (AirPlay 2, auto pairing)...");
     let mut conn = Connection::connect_auto(device, config, "3939").await?;
     eprintln!("Connected. Setting up stream...");

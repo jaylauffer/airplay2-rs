@@ -92,6 +92,10 @@ enum SenderMessage {
         /// Pre-serialized sync packet bytes, if sync is needed this frame.
         /// Shared across all targets (sync content is identical for all devices).
         sync_data: Option<Vec<u8>>,
+        /// When the encode loop stamped `sync_data`'s NTP timestamp, so the
+        /// sender thread can correct it for however long this message then
+        /// waited in the queue. See `restamp_sync_ntp`.
+        stamped_at: std::time::Instant,
     },
     /// Pause: sender thread should stop advancing deadlines and wait for Resume.
     Pause,
@@ -158,6 +162,32 @@ struct SendTarget {
 /// When `burst_size > 1`, packets are buffered and sent in bursts to reduce
 /// WiFi/Bluetooth interference on shared-radio devices (e.g., Pi Zero 2 W).
 /// For example, burst_size=4 sends 4 packets rapidly, then waits 4*frame_duration.
+/// Rewrite an NTP sync packet's timestamp (bytes 8-15) to the instant the
+/// packet actually goes on the wire.
+///
+/// The encode loop stamps that timestamp when it builds the packet, but the
+/// packet then waits in this thread's queue -- a steady ~76ms deep on a Mac
+/// mini. Sending the stale value tells the receiver the audio should already
+/// have been rendered that long ago, which silently eats the same amount out
+/// of the declared render latency: at a declared 100ms it left roughly 24ms
+/// of real headroom and the HomePod gave up after a few seconds. Re-stamping
+/// here makes the declared latency mean what it says, and makes it
+/// independent of however deep the queue happens to run.
+///
+/// Only NTP sync packets (20 bytes) are touched; PTP sync packets are 28
+/// bytes and carry a different layout.
+fn restamp_sync_ntp(mut sync: Vec<u8>, stamped_at: std::time::Instant) -> Vec<u8> {
+    if sync.len() != 20 {
+        return sync;
+    }
+    // NTP timestamps are 32.32 fixed point seconds, so a nanosecond delta
+    // scales by 2^32 / 1e9.
+    let delta = ((stamped_at.elapsed().as_nanos() << 32) / 1_000_000_000) as u64;
+    let stamped = u64::from_be_bytes(sync[8..16].try_into().unwrap());
+    sync[8..16].copy_from_slice(&stamped.wrapping_add(delta).to_be_bytes());
+    sync
+}
+
 fn sender_thread_main(
     rx: Receiver<SenderMessage>,
     targets: Vec<SendTarget>,
@@ -186,7 +216,8 @@ fn sender_thread_main(
 
     // Burst buffer for WiFi/BT coexistence
     // Each entry: (wire_packets per target, optional shared sync data)
-    let mut burst_buffer: Vec<(Vec<Vec<u8>>, Option<Vec<u8>>)> = Vec::with_capacity(burst_size);
+    let mut burst_buffer: Vec<(Vec<Vec<u8>>, Option<Vec<u8>>, std::time::Instant)> =
+        Vec::with_capacity(burst_size);
 
     let target_count = targets.len();
     tracing::info!(
@@ -241,9 +272,9 @@ fn sender_thread_main(
                 { next_deadline = std::time::Instant::now(); }
                 continue;
             }
-            SenderMessage::Packet { wire_packets, sync_data } => {
+            SenderMessage::Packet { wire_packets, sync_data, stamped_at } => {
                 // Buffer packet for burst sending
-                burst_buffer.push((wire_packets, sync_data));
+                burst_buffer.push((wire_packets, sync_data, stamped_at));
 
                 // Only send when we have a full burst (or first packet to initialize timing)
                 if burst_buffer.len() < burst_size && started {
@@ -313,9 +344,10 @@ fn sender_thread_main(
                 last_send = send_time;
 
                 // Send all buffered packets
-                for (wire_packets, sync_data) in burst_buffer.drain(..) {
+                for (wire_packets, sync_data, stamped_at) in burst_buffer.drain(..) {
                     // Send sync packet to ALL targets' control dests
-                    if let Some(ref sync) = sync_data {
+                    if let Some(sync) = sync_data.map(|s| restamp_sync_ntp(s, stamped_at)) {
+                        let sync = &sync;
                         for target in &targets {
                             let sock = target.control_socket.as_ref()
                                 .unwrap_or(&target.data_socket);
@@ -1207,7 +1239,11 @@ async fn run_streamer(
                         // Drop the mutex guard first so other async tasks can proceed
                         drop(guard);
                         let tx_clone = tx.clone();
-                        let msg = SenderMessage::Packet { wire_packets, sync_data };
+                        let msg = SenderMessage::Packet {
+                            wire_packets,
+                            sync_data,
+                            stamped_at: std::time::Instant::now(),
+                        };
                         let send_result = tokio::task::spawn_blocking(move || {
                             tx_clone.send(msg)
                         }).await;
