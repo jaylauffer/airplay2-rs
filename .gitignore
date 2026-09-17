@@ -1,4 +1,4 @@
 /target
 framework_analysis
 cross-compile.sh
-deploy-to-pi.sh
+deploy-to-pi.sh.DS_Store
